@@ -509,7 +509,7 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
   equation
     T_w_in = Medium.temperature(Medium.setState_phX(port_a.p, inStream(port_a.h_outflow)));
     C_w = max(port_a.m_flow, 0)*Medium.specificHeatCapacityCp(Medium.setState_phX(port_a.p, inStream(port_a.h_outflow)));
-// si l'aigua que torna de baix del dipòsit ve calenta, el dipòsit és ple: es refreda fins a T_out_set
+// Control por temperatura de retorno: puede enfriar antes de que el depósito esté lleno.
     Q = min(Q_max, C_w*max(T_w_in - T_out_set, 0));
     heat.Q_flow = fill(-Q/2, 2);
     connect(heat.port, waterSide.heatPorts);
@@ -886,8 +886,28 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     Modelica.Units.SI.HeatFlowRate Q_tower = tower.Q "Calor rebutjada";
     Modelica.Units.SI.HeatFlowRate Q_tank = Q_plant - tower.Q - Q_served - tank.Q_loss "Càrrega (+) / descàrrega (-) del dipòsit (aprox.)";
     Real SOC = tank.SOC "Estat de càrrega del dipòsit";
-    Boolean tankFull = full.y "Senyal per al grup de Control";
+    Boolean tankWarmReturn = full.y "Señal original de retorno caliente (histéresis 60/70 °C); no equivale a depósito lleno";
+    Modelica.Units.SI.Energy E_capacity_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*(tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Capacidad térmica útil entre las referencias Tmin y Tmax";
+    Modelica.Units.SI.Energy E_tank_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*min(max(tank.T_layers[i] - tank.T_min, 0), tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Energía útil por capa; excluye el calentamiento por encima de Tmax";
+    EnergyUseMonitor performance "Medidas de aprovechamiento y estados del depósito y la torre" annotation(Placement(transformation(extent = {{315, 50}, {335, 70}})));
+    Real eta_useful = performance.eta_useful "Aprovechamiento energético instantáneo";
+    Real eta_useful_accum = performance.eta_useful_accum "Aprovechamiento energético acumulado desde el inicio";
+    Real SOC_useful = performance.SOC_useful "SOC acotado calculado con la energía útil de cada capa";
+    Boolean tankFull = performance.tankFull "Depósito prácticamente lleno";
+    Boolean towerActive = performance.towerActive "Rechazo térmico apreciable en la torre";
+    Boolean fullAndCooling = performance.fullAndCooling "Depósito lleno y torre activa";
+    Modelica.Units.SI.Temperature T_tower_out = Water.temperature(Water.setState_phX(tower.port_b.p, tower.port_b.h_outflow)) "Temperatura real de salida de la torre";
+    Modelica.Units.SI.Power Q_tower_from_ports = -sum(tower.waterSide.heatPorts.Q_flow) "Calor que se extrae del agua por los puertos térmicos";
   equation
+    performance.P_el = G.P_el;
+    performance.Q_fuel = CC.Q_fuel;
+    performance.Q_generated = ECO.Q + cond.Q;
+    performance.Q_delivered = building.Q;
+    performance.Q_rejected = tower.Q;
+    performance.E_tank_useful = E_tank_useful;
+    performance.E_capacity = E_capacity_useful;
+    performance.T_layer_max = max(tank.T_layers);
+    performance.T_limit = tank.T_max;
     econ.Q_plant = Q_plant;
     connect(air.outlet, C1.inlet) annotation(
       Line(points = {{-90, 80}, {-75, 80}}, color = {0, 128, 255}));
@@ -1038,12 +1058,32 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     Real eta_global = eta_el + eta_th "Rendimiento de cogeneración bruto";
     Modelica.Units.SI.MassFlowRate m_reference = ref.ports[1].m_flow "Caudal en la referencia de presión; debe ser prácticamente nulo con agua incompresible";
     Boolean tankAboveReference = tank.T_top > T_tank_max "Indica que la capa superior supera la referencia de carga";
+    Modelica.Units.SI.Energy E_capacity_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*(tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Capacidad térmica útil entre las referencias Tmin y Tmax";
+    Modelica.Units.SI.Energy E_tank_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*min(max(tank.T_layers[i] - tank.T_min, 0), tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Energía útil por capa; excluye el calentamiento por encima de Tmax";
+    EnergyUseMonitor performance "Medidas de aprovechamiento y estados del depósito y la torre" annotation(Placement(transformation(extent = {{315, 50}, {335, 70}})));
+    Real eta_useful = performance.eta_useful "Aprovechamiento energético instantáneo";
+    Real eta_useful_accum = performance.eta_useful_accum "Aprovechamiento energético acumulado desde el inicio";
+    Real SOC_useful = performance.SOC_useful "SOC acotado calculado con la energía útil de cada capa";
+    Boolean tankFull = performance.tankFull "Depósito prácticamente lleno";
+    Boolean towerActive = performance.towerActive "Rechazo térmico apreciable en la torre";
+    Boolean fullAndCooling = performance.fullAndCooling "Depósito lleno y torre activa";
+    Modelica.Units.SI.Temperature T_tower_out = Water.temperature(Water.setState_phX(tower.port_b.p, tower.port_b.h_outflow)) "Temperatura real de salida de la torre";
+    Modelica.Units.SI.Power Q_tower_from_ports = -sum(tower.waterSide.heatPorts.Q_flow) "Calor que se extrae del agua por los puertos térmicos";
   initial equation
     assert(m_charge > 0, "m_charge debe ser positivo");
     assert(nSeg >= 2 and V_tank > 0 and H_tank > 0, "Geometría del depósito no válida");
     assert(T_tank_max > T_tank_min, "T_tank_max debe superar T_tank_min");
     assert(T_tank_max < T_cond, "La referencia superior del depósito debe ser menor que la temperatura de condensación");
   equation
+    performance.P_el = G.P_el;
+    performance.Q_fuel = CC.Q_fuel;
+    performance.Q_generated = ECO.Q + cond.Q;
+    performance.Q_delivered = 0;
+    performance.Q_rejected = tower.Q;
+    performance.E_tank_useful = E_tank_useful;
+    performance.E_capacity = E_capacity_useful;
+    performance.T_layer_max = max(tank.T_layers);
+    performance.T_limit = tank.T_max;
     connect(air.outlet, C1.inlet) annotation(Line(points = {{-168, 65}, {-147, 65}, {-147, 65}}, color = {185, 114, 35}));
     connect(C1.outlet, IC.inlet) annotation(Line(points = {{-123, 65}, {-102, 65}, {-102, 65}}, color = {185, 114, 35}));
     connect(IC.outlet, C2.inlet) annotation(Line(points = {{-78, 65}, {-57, 65}, {-57, 65}}, color = {185, 114, 35}));
@@ -1076,6 +1116,78 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
       Diagram(coordinateSystem(extent = {{-205, -165}, {380, 135}})),
       Documentation(info = "<html><p>Modelo de carga del depósito. Abrir y simular CicleGas2.CicloCombinadoDeposito.</p><p>Agua: fondo del depósito, bomba, torre, economizador, condensador, parte superior del depósito. Vapor: HRSG, turbina, condensador, bomba de alimentación, HRSG. Los fluidos no se mezclan.</p><p>Los parámetros son orientativos y proceden del archivo original. La torre enfría por temperatura de retorno, no por SOC. T_tank_max es una referencia, no un control de seguridad. Para carga y descarga con consumo, usar CentralCompleta.</p><p>Q_storage usa los flujos de entalpía de los puertos. Q_aux_storage distingue la acumulación en los intercambiadores del almacenamiento en el depósito. P_el no incluye consumos de las bombas ideales de red ni de la torre.</p><p>Verificación pendiente: compilación y simulación con Modelica Standard Library 4.0.0.</p></html>"));
   end CicloCombinadoDeposito;
+
+  block EnergyUseMonitor "Aprovechamiento energético con contabilidad del almacenamiento"
+    parameter Real SOC_full = 0.98 "Umbral de depósito prácticamente lleno";
+    parameter Modelica.Units.SI.Power Q_tol = 1000 "Umbral para considerar una potencia despreciable";
+    input Modelica.Units.SI.Power P_el "Electricidad neta del generador; auxiliares de red no incluidos";
+    input Modelica.Units.SI.Power Q_fuel "Potencia química del combustible, PCI";
+    input Modelica.Units.SI.Power Q_generated "Calor bruto cedido por condensador y economizador";
+    input Modelica.Units.SI.Power Q_delivered "Calor realmente entregado a consumidores";
+    input Modelica.Units.SI.Power Q_rejected "Calor disipado en la torre";
+    input Modelica.Units.SI.Energy E_tank_useful "Energía del depósito acotada por capa entre Tmin y Tmax";
+    input Modelica.Units.SI.Energy E_capacity "Capacidad útil total del depósito";
+    input Modelica.Units.SI.Temperature T_layer_max "Máxima temperatura de las capas del depósito";
+    input Modelica.Units.SI.Temperature T_limit "Temperatura máxima de referencia";
+    parameter Modelica.Units.SI.Energy E_initial(fixed = false) "Energía útil presente al iniciar el ensayo";
+    Modelica.Units.SI.Energy E_el(start = 0, fixed = true) "Electricidad generada desde el inicio";
+    Modelica.Units.SI.Energy E_fuel(start = 0, fixed = true) "Combustible consumido desde el inicio";
+    Modelica.Units.SI.Energy E_delivered(start = 0, fixed = true) "Calor entregado desde el inicio";
+    Modelica.Units.SI.Energy E_rejected(start = 0, fixed = true) "Calor disipado desde el inicio";
+    Modelica.Units.SI.Power P_storage_useful "Aumento o disminución real de energía útil almacenada";
+    Real SOC_useful "Fracción de la capacidad útil entre cero y uno";
+    Real eta_el "Rendimiento eléctrico del ciclo";
+    Real eta_gross "Electricidad y calor bruto antes de rechazo y pérdidas";
+    Real eta_useful "Aprovechamiento instantáneo: electricidad, consumo y variación útil del depósito";
+    Real eta_useful_accum "Aprovechamiento desde el inicio, descontando la energía inicial del depósito";
+    Real f_rejected "Fracción instantánea del calor bruto rechazada a la torre";
+    Boolean tankFull "SOC útil mayor o igual que el umbral de lleno";
+    Boolean towerActive "La torre rechaza más de Q_tol";
+    Boolean fullAndCooling "Depósito lleno y torre rechazando calor";
+    Boolean coolingBeforeFull "La torre ya enfría antes de llenarse el depósito";
+    Boolean fullWithoutCooling "Depósito lleno con calor generado, pero sin rechazo apreciable";
+    Boolean overTemperature "Alguna capa supera la referencia máxima en más de 0,5 K";
+    Boolean storageNearlySteady "La variación de energía útil almacenada es menor que Q_tol";
+  initial equation
+    E_initial = E_tank_useful;
+    assert(SOC_full > 0 and SOC_full <= 1, "SOC_full debe estar entre cero y uno");
+    assert(Q_tol > 0, "Q_tol debe ser positivo");
+  equation
+    der(E_el) = P_el;
+    der(E_fuel) = Q_fuel;
+    der(E_delivered) = Q_delivered;
+    der(E_rejected) = Q_rejected;
+    P_storage_useful = der(E_tank_useful);
+    SOC_useful = E_tank_useful/max(E_capacity, 1);
+    eta_el = if Q_fuel > Q_tol then P_el/Q_fuel else 0;
+    eta_gross = if Q_fuel > Q_tol then (P_el + Q_generated)/Q_fuel else 0;
+    eta_useful = if Q_fuel > Q_tol then (P_el + Q_delivered + P_storage_useful)/Q_fuel else 0;
+    eta_useful_accum = if E_fuel > 1 then (E_el + E_delivered + E_tank_useful - E_initial)/E_fuel else 0;
+    f_rejected = if Q_generated > Q_tol then Q_rejected/Q_generated else 0;
+    tankFull = SOC_useful >= SOC_full;
+    towerActive = Q_rejected > Q_tol;
+    fullAndCooling = tankFull and towerActive;
+    coolingBeforeFull = towerActive and not tankFull;
+    fullWithoutCooling = tankFull and Q_generated > Q_tol and not towerActive;
+    overTemperature = T_layer_max > T_limit + 0.5;
+    storageNearlySteady = abs(P_storage_useful) < Q_tol;
+    annotation(Documentation(info = "<html><p>Balance energético de primer principio ampliado al almacenamiento. P_storage_useful conserva el signo: no debe sustituirse por max(P_storage_useful,0), porque durante la descarga se contabilizaría dos veces la misma energía.</p><p>La energía útil se acota en cada capa para excluir sobretemperatura y energía por debajo de Tmin. eta_useful puede tener transitorios fuera del intervalo 0..1 por intercambios con otros volúmenes inicialmente calientes. eta_useful_accum corrige la energía inicial del depósito, pero requiere también atender al cambio de energía de los otros componentes al comparar intervalos cortos.</p><p>Este bloque observa la instalación; no cambia el control térmico de la torre. Sus señales no garantizan la suficiencia de refrigeración: deben revisarse simultáneamente Q_rejected y la evolución de todas las temperaturas.</p></html>"));
+  end EnergyUseMonitor;
+
+  model EnsayoDepositoFrio "Comparación: depósito inicialmente a 50 °C"
+    extends CicloCombinadoDeposito(T_tank_start = 323.15);
+    annotation(experiment(StopTime = 86400, Interval = 60, Tolerance = 1e-6));
+  end EnsayoDepositoFrio;
+
+  model EnsayoDepositoLleno "Comparación: depósito inicialmente a 90 °C"
+    extends CicloCombinadoDeposito(T_tank_start = 363.15);
+    annotation(experiment(StopTime = 86400, Interval = 60, Tolerance = 1e-6));
+  end EnsayoDepositoLleno;
+
+  model EnsayoPotencia125 "Escala orientativa de potencia al 125 por ciento"
+    extends CicloCombinadoDeposito(m_air = 6.25, m_fuel = 0.1325, m_charge = 15.25, Q_tower_max = 3.125e6, T_tank_start = 323.15);
+    annotation(experiment(StopTime = 86400, Interval = 60, Tolerance = 1e-6));
+  end EnsayoPotencia125;
 
   annotation(
     uses(Modelica(version = "4.0.0")));
