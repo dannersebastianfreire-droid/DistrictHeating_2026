@@ -1,0 +1,28 @@
+
+Resultados:
+
+La salida HeatPort funciona. Con la temperatura de impulsión (90–95 °C) y el caudal, devuelve el agua al fondo del depósito a 50 °C y entrega exactamente el calor pedido. La temperatura del puerto queda entre 47 y 50 °C. El balance de energía cuadra.
+Funciona en los dos sentidos: si el grupo de Demanda impone el calor, el modelo devuelve la temperatura; si impone la temperatura, devuelve el calor.
+Llenado: el depósito se llena en unas 16 h.
+Punta: cuando la demanda supera a la central (6–10 h), el depósito cubre el déficit y la torre se para.
+Noche: la torre rechaza toda la producción.
+Balance de un día en régimen:
+Concepto	MWh/día
+Combustible	122
+Electricidad	48,5
+Calor producido	49,1
+Calor entregado	24,6
+Calor rechazado en la torre	24,4 (50 % del calor producido)
+Aprovechamiento: 0,60 en un día. El indicador marca 0,40 por la noche y 0,80 en la punta.
+Economía orientativa: el calor rechazado cuesta unos 1.500 €/día y el margen de operación sale a −643 €/día. La he calculado a mano con los precios del bloque de economía, porque ese bloque no está en este ensayo.
+Conclusiones
+
+Hay que acordar con el grupo de Demanda cómo usan el puerto. Si imponen calor con una fuente ideal, el modelo lo entrega aunque no haya energía y el agua se enfría sin límite. Deben bajar su demanda cuando baja la temperatura del puerto, o imponer ellos la temperatura, que es lo más seguro.
+Límites actuales de la descarga: unos 2,5 MW como máximo (15 kg/s con 40 K de salto) y 9,3 MWh de energía útil en el depósito.
+Con la central siempre a plena carga, el depósito casi no trabaja. Su carga solo oscila entre 0,98 y 1 y la torre tira la mitad del calor. Falta el control que pide el profesor: parar o modular la central según el nivel del depósito, con histéresis. Es lo que hará trabajar al depósito y bajará el rechazo.
+La torre actúa por temperatura de retorno (55 °C), no por el estado del depósito. Por eso rechaza calor antes de que esté lleno (1,3 MWh el primer día) y el depósito se queda a 95 °C, por encima de su referencia de 90 °C.
+Decisiones pendientes
+
+Para hacer trabajar al depósito, el siguiente paso es el control de la central por nivel de carga y repetir CentralHeatPort. ¿Lo hago?
+¿Cambiamos la torre para que actúe según el nivel del depósito o la temperatura del fondo, o le subimos la consigna?
+Revisa los resultados y el informe antes de presentarlos o entregarlos.

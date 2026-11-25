@@ -408,7 +408,7 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
       Placement(transformation(extent = {{100, 30}, {120, 50}})));
     Modelica.Blocks.Interfaces.RealOutput T_bot(unit = "K") "Termòmetre de la capa de baix" annotation(
       Placement(transformation(extent = {{100, -50}, {120, -30}})));
-    Modelica.Fluid.Pipes.DynamicPipe tank(redeclare package Medium = Medium, length = H, diameter = D, height_ab = -H, nNodes = nSeg, modelStructure = Modelica.Fluid.Types.ModelStructure.av_vb, use_HeatTransfer = true, momentumDynamics = Modelica.Fluid.Types.Dynamics.SteadyState, T_start = T_start, p_a_start = p_bot_start - 1000*9.81*H, p_b_start = p_bot_start) annotation(
+    Modelica.Fluid.Pipes.DynamicPipe tank(redeclare package Medium = Medium, length = H, diameter = D, height_ab = -H, nNodes = nSeg, modelStructure = Modelica.Fluid.Types.ModelStructure.av_vb, use_HeatTransfer = true, momentumDynamics = Modelica.Fluid.Types.Dynamics.SteadyState, T_start = T_start, p_a_start = p_bot_start - 1000*9.81*H, p_b_start = p_bot_start, redeclare model FlowModel = Modelica.Fluid.Pipes.BaseClasses.FlowModels.NominalLaminarFlow(dp_nominal = 10, m_flow_nominal = 10)) "v3: rozamiento lineal (despreciable en D ≈ 4,6 m) para que la inversión de flujo carga/descarga sea robusta" annotation(
       Placement(transformation(extent = {{-10, -10}, {10, 10}}, rotation = -90)));
     Modelica.Thermal.HeatTransfer.Components.ThermalConductor loss[nSeg](each G = U*Modelica.Constants.pi*D*H/nSeg) "Pèrdues de cada capa" annotation(
       Placement(transformation(extent = {{20, -10}, {40, 10}})));
@@ -418,8 +418,14 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     Modelica.Units.SI.Temperature T_top "Temperatura de la capa de dalt";
     Modelica.Units.SI.HeatFlowRate Q_loss "Pèrdues totals a l'ambient";
     Modelica.Units.SI.Energy E_stored "Energia útil emmagatzemada (sobre T_min)";
+    Modelica.Units.SI.Energy E_capacity "Capacidad útil entre T_min y T_max";
+    Modelica.Units.SI.Energy E_useful "Energía útil acotada por capa entre T_min y T_max";
+    Modelica.Units.SI.HeatFlowRate P_useful "dE_useful/dt calculado con der(T) de cada capa (evita derivar el sistema hidráulico)";
   equation
     T_layers = tank.mediums.T;
+    E_capacity = sum(tank.ms[i]*Medium.specificHeatCapacityCp(tank.mediums[i].state)*(T_max - T_min) for i in 1:nSeg);
+    E_useful = sum(tank.ms[i]*Medium.specificHeatCapacityCp(tank.mediums[i].state)*min(max(T_layers[i] - T_min, 0), T_max - T_min) for i in 1:nSeg);
+    P_useful = sum(tank.ms[i]*Medium.specificHeatCapacityCp(tank.mediums[i].state)*(if noEvent(T_layers[i] > T_min and T_layers[i] < T_max) then der(T_layers[i]) else 0) for i in 1:nSeg);
     T_top = T_layers[1];
     T_bot = T_layers[nSeg];
     E_stored = sum(tank.ms[i]*Medium.specificHeatCapacityCp(tank.mediums[i].state)*(T_layers[i] - T_min) for i in 1:nSeg);
@@ -432,6 +438,122 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     annotation(
       Icon(graphics = {Rectangle(extent = {{-50, 90}, {50, -90}}, lineColor = {0, 0, 0}, fillColor = {0, 118, 207}, fillPattern = FillPattern.VerticalCylinder, radius = 20), Rectangle(extent = {{-50, 90}, {50, 20}}, lineColor = {0, 0, 0}, fillColor = {220, 60, 40}, fillPattern = FillPattern.VerticalCylinder, radius = 20), Text(extent = {{-150, -95}, {150, -125}}, textString = "%name", textColor = {0, 0, 255})}));
   end StratifiedTank;
+
+  model DischargeHX "Descarga del depósito hacia un HeatPort: agua de arriba -> intercambiador -> vuelve por abajo"
+    // Física (corriente de agua contra un nodo térmico de temperatura uniforme T_port, C_r = 0):
+    //   C      = m·cp
+    //   ε      = 1 - exp(-UA/C)
+    //   Q      = ε·C·(T_in - T_port)          (calor que sale por el HeatPort)
+    //   T_out  = T_in - Q/C                   (temperatura con la que vuelve al fondo del depósito)
+    // Funciona con las dos causalidades del HeatPort:
+    //   - el consumidor impone Q (PrescribedHeatFlow) -> salen T_port y T_out
+    //   - el consumidor impone T (PrescribedTemperature / capacidad térmica) -> salen Q y T_out
+    replaceable package Medium = Modelica.Media.Water.ConstantPropertyLiquidWater constrainedby Modelica.Media.Interfaces.PartialMedium "Aigua" annotation(
+       choicesAllMatching = true);
+    parameter Modelica.Units.SI.ThermalConductance UA = 1.5e5 "UA del intercambiador de descarga";
+    parameter Boolean use_m_flow_in = false "true: caudal impuesto por señal; false: caudal por ΔT de diseño";
+    parameter Modelica.Units.SI.Temperature T_ret_set = 323.15 "Temperatura de retorno objetivo al depósito (50 °C), modo ΔT";
+    parameter Modelica.Units.SI.MassFlowRate m_flow_max = 15 "Caudal máximo de la bomba de descarga";
+    parameter Modelica.Units.SI.MassFlowRate m_flow_min = 0.05 "Caudal mínimo (evita C = 0)";
+    parameter Modelica.Units.SI.TemperatureDifference dT_min = 2 "ΔT mínimo para el cálculo del caudal en modo ΔT";
+    parameter Modelica.Units.SI.Temperature T_use_min = 323.15 "Por debajo de esta T de suministro el depósito se considera agotado";
+    Modelica.Fluid.Interfaces.FluidPort_a port_a(redeclare package Medium = Medium) "Toma de agua caliente (arriba del depósito)" annotation(
+      Placement(transformation(extent = {{-10, 90}, {10, 110}})));
+    Modelica.Fluid.Interfaces.FluidPort_b port_b(redeclare package Medium = Medium) "Retorno de agua enfriada (abajo del depósito)" annotation(
+      Placement(transformation(extent = {{-10, -110}, {10, -90}})));
+    Modelica.Thermal.HeatTransfer.Interfaces.HeatPort_b heatPort(T(start = 323.15)) "Salida térmica hacia el consumidor (Q_flow < 0 = sale calor)" annotation(
+      Placement(transformation(extent = {{-110, -10}, {-90, 10}})));
+    Modelica.Blocks.Interfaces.RealInput m_flow_in(unit = "kg/s") if use_m_flow_in "Caudal de descarga impuesto" annotation(
+      Placement(transformation(extent = {{140, -20}, {100, 20}})));
+    Modelica.Blocks.Interfaces.RealOutput Q(unit = "W") "Calor entregado al consumidor" annotation(
+      Placement(transformation(extent = {{100, 50}, {120, 70}})));
+    Modelica.Blocks.Interfaces.RealOutput T_supply(unit = "K") "Temperatura del agua que entra al intercambiador" annotation(
+      Placement(transformation(extent = {{100, 30}, {120, 50}})));
+    Modelica.Blocks.Interfaces.RealOutput T_return(unit = "K") "Temperatura del agua que vuelve al depósito" annotation(
+      Placement(transformation(extent = {{100, -50}, {120, -30}})));
+    Modelica.Units.SI.MassFlowRate m_flow "Caudal de descarga";
+    Modelica.Units.SI.SpecificHeatCapacity cp "cp del agua";
+    Modelica.Units.SI.ThermalConductance C "Capacidad calorífica de la corriente";
+    Real NTU "Número de unidades de transferencia";
+    Real eps "Eficacia del intercambiador";
+    Modelica.Units.SI.SpecificEnthalpy h_in "Entalpía de entrada";
+    Boolean depleted "Suministro por debajo de T_use_min (depósito agotado)";
+    Boolean saturated "La bomba de descarga está al máximo: el retorno ya no llega a T_ret_set";
+    Modelica.Units.SI.TemperatureDifference dT_eff "Salto térmico de diseño usado para el caudal";
+    Modelica.Units.SI.MassFlowRate m_req "Caudal pedido antes de límites";
+    Modelica.Units.SI.MassFlowRate m_cap "Caudal tras el límite superior";
+  protected
+    Modelica.Blocks.Interfaces.RealInput m_flow_internal "Conector interno para la entrada condicional";
+  equation
+    connect(m_flow_in, m_flow_internal);
+    if not use_m_flow_in then
+      m_flow_internal = 0;
+    end if;
+    h_in = inStream(port_a.h_outflow);
+    cp = Medium.specificHeatCapacityCp(Medium.setState_phX(port_a.p, h_in));
+    T_supply = Medium.temperature(Medium.setState_phX(port_a.p, h_in));
+    Q = -heatPort.Q_flow;
+// caudal: impuesto, o el necesario para volver a T_ret_set con el calor que pide el consumidor
+// límites suavizados (regStep): m_flow está dentro de un lazo algebraico (mezcla en el nodo superior) y un min/max con esquina hace fallar al solver
+    dT_eff = Modelica.Fluid.Utilities.regStep(T_supply - T_ret_set - dT_min, T_supply - T_ret_set, dT_min, 0.5);
+    m_req = if use_m_flow_in then m_flow_internal else Q/(cp*dT_eff);
+    m_cap = Modelica.Fluid.Utilities.regStep(m_req - m_flow_max, m_flow_max, m_req, 0.05*m_flow_max);
+    m_flow = Modelica.Fluid.Utilities.regStep(m_cap - m_flow_min, m_cap, m_flow_min, 0.5*m_flow_min);
+    saturated = noEvent(m_req > m_flow_max);
+    C = m_flow*cp;
+    NTU = UA/C;
+    eps = 1 - exp(-NTU);
+    Q = eps*C*(T_supply - heatPort.T);
+// hidráulica: bomba ideal (impone caudal, el salto de presión lo da el resto del circuito)
+    port_a.m_flow = m_flow;
+    port_a.m_flow + port_b.m_flow = 0;
+    port_b.h_outflow = h_in - Q/m_flow;
+    port_a.h_outflow = inStream(port_b.h_outflow);
+    port_b.Xi_outflow = inStream(port_a.Xi_outflow);
+    port_a.Xi_outflow = inStream(port_b.Xi_outflow);
+    port_b.C_outflow = inStream(port_a.C_outflow);
+    port_a.C_outflow = inStream(port_b.C_outflow);
+    T_return = Medium.temperature(Medium.setState_phX(port_b.p, port_b.h_outflow));
+    depleted = noEvent(T_supply < T_use_min);
+    assert(T_return > 278.15, "DischargeHX: el retorno baja de 5 °C; el consumidor pide más calor del que el depósito puede dar", AssertionLevel.warning);
+    annotation(
+      Icon(graphics = {Rectangle(extent = {{-80, 80}, {80, -80}}, lineColor = {0, 0, 0}, fillColor = {255, 230, 200}, fillPattern = FillPattern.Solid, radius = 10), Line(points = {{0, 80}, {0, 50}, {-40, 30}, {40, 10}, {-40, -10}, {40, -30}, {0, -50}, {0, -80}}, color = {200, 30, 30}, thickness = 0.5), Line(points = {{-90, 0}, {-50, 0}}, color = {191, 0, 0}, thickness = 0.5), Text(extent = {{-150, -85}, {150, -115}}, textString = "%name", textColor = {0, 0, 255})}),
+      Documentation(info = "<html><p>Interfaz de salida del depósito como <b>HeatPort</b> (T, Q_flow) para el grupo de Demanda.</p><p>Modelo: corriente de agua (m, T_in) contra un nodo térmico uniforme T_port (C_r = 0): ε = 1 - exp(-UA/(m·cp)), Q = ε·m·cp·(T_in - T_port), T_out = T_in - Q/(m·cp).</p><p>Si UA es grande, T_port tiende a T_out (temperatura de retorno). T_supply y T_return se dan como salidas para que el consumidor vea también la temperatura de impulsión.</p><p>Modo ΔT (por defecto): m = Q/(cp·(T_in - T_ret_set)), acotado entre m_flow_min y m_flow_max. Si se satura en m_flow_max, el retorno baja por debajo de T_ret_set y T_port cae: el depósito ya no puede dar la potencia pedida a esa temperatura.</p></html>"));
+  end DischargeHX;
+
+  model StratifiedTankHP "Depósito estratificado con salida tipo HeatPort (descarga por intercambiador interno)"
+    extends StratifiedTank;
+    parameter Modelica.Units.SI.ThermalConductance UA_dis = 1.5e5 "UA del intercambiador de descarga";
+    parameter Boolean use_m_flow_in = false "true: caudal de descarga por señal";
+    parameter Modelica.Units.SI.Temperature T_ret_set = T_min "Retorno objetivo al fondo del depósito";
+    parameter Modelica.Units.SI.MassFlowRate m_dis_max = 15 "Caudal máximo de descarga";
+    parameter Modelica.Units.SI.MassFlowRate m_dis_min = 0.05 "Caudal mínimo de descarga";
+    Modelica.Thermal.HeatTransfer.Interfaces.HeatPort_b heatPort_dis "SALIDA DEL DEPÓSITO: conectar aquí el consumidor (T, Q_flow)" annotation(
+      Placement(transformation(extent = {{-110, -10}, {-90, 10}})));
+    Modelica.Blocks.Interfaces.RealInput m_dis_in(unit = "kg/s") if use_m_flow_in "Caudal de descarga impuesto" annotation(
+      Placement(transformation(extent = {{-140, -80}, {-100, -40}})));
+    Modelica.Blocks.Interfaces.RealOutput Q_dis(unit = "W") "Calor entregado por el HeatPort" annotation(
+      Placement(transformation(extent = {{100, 70}, {120, 90}})));
+    Modelica.Blocks.Interfaces.RealOutput T_dis_supply(unit = "K") "T del agua que sale de arriba hacia el intercambiador" annotation(
+      Placement(transformation(extent = {{100, 50}, {120, 70}})));
+    Modelica.Blocks.Interfaces.RealOutput T_dis_return(unit = "K") "T del agua que vuelve al fondo" annotation(
+      Placement(transformation(extent = {{100, -70}, {120, -50}})));
+    DischargeHX dis(redeclare package Medium = Medium, UA = UA_dis, use_m_flow_in = use_m_flow_in, T_ret_set = T_ret_set, m_flow_max = m_dis_max, m_flow_min = m_dis_min, T_use_min = T_min) annotation(
+      Placement(transformation(extent = {{-60, -10}, {-40, 10}})));
+    Modelica.Units.SI.MassFlowRate m_dis = dis.m_flow "Caudal de descarga";
+    Modelica.Units.SI.Temperature T_port = heatPort_dis.T "Temperatura en el HeatPort";
+  equation
+    connect(tank.port_a, dis.port_a);
+    connect(dis.port_b, tank.port_b);
+    connect(dis.heatPort, heatPort_dis);
+    connect(m_dis_in, dis.m_flow_in);
+    connect(dis.Q, Q_dis);
+    connect(dis.T_supply, T_dis_supply);
+    connect(dis.T_return, T_dis_return);
+    annotation(
+      Icon(graphics = {Line(points = {{-90, 0}, {-50, 0}}, color = {191, 0, 0}, thickness = 1), Rectangle(extent = {{-100, 10}, {-80, -10}}, lineColor = {191, 0, 0}, fillColor = {191, 0, 0}, fillPattern = FillPattern.Solid)}),
+      Documentation(info = "<html><p>Igual que StratifiedTank (puertos de fluido port_top/port_bot para la carga desde la central) más una <b>salida HeatPort</b> heatPort_dis para el consumidor.</p><p>Internamente: bomba ideal + intercambiador (DischargeHX) que toma agua de la capa superior y la devuelve enfriada a la capa inferior. Balance: dE/dt = H_carga - Q_dis - Q_loss.</p></html>"));
+  end StratifiedTankHP;
 
   model IdealPump "Bomba ideal: imposa el cabal (senyal), sense pèrdues"
     replaceable package Medium = Modelica.Media.Water.ConstantPropertyLiquidWater constrainedby Modelica.Media.Interfaces.PartialMedium "Aigua" annotation(
@@ -887,8 +1009,8 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     Modelica.Units.SI.HeatFlowRate Q_tank = Q_plant - tower.Q - Q_served - tank.Q_loss "Càrrega (+) / descàrrega (-) del dipòsit (aprox.)";
     Real SOC = tank.SOC "Estat de càrrega del dipòsit";
     Boolean tankWarmReturn = full.y "Señal original de retorno caliente (histéresis 60/70 °C); no equivale a depósito lleno";
-    Modelica.Units.SI.Energy E_capacity_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*(tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Capacidad térmica útil entre las referencias Tmin y Tmax";
-    Modelica.Units.SI.Energy E_tank_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*min(max(tank.T_layers[i] - tank.T_min, 0), tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Energía útil por capa; excluye el calentamiento por encima de Tmax";
+    Modelica.Units.SI.Energy E_capacity_useful = tank.E_capacity "Capacidad térmica útil entre las referencias Tmin y Tmax";
+    Modelica.Units.SI.Energy E_tank_useful = tank.E_useful "Energía útil por capa; excluye el calentamiento por encima de Tmax";
     EnergyUseMonitor performance "Medidas de aprovechamiento y estados del depósito y la torre" annotation(Placement(transformation(extent = {{315, 50}, {335, 70}})));
     Real eta_useful = performance.eta_useful "Aprovechamiento energético instantáneo";
     Real eta_useful_accum = performance.eta_useful_accum "Aprovechamiento energético acumulado desde el inicio";
@@ -908,6 +1030,7 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     performance.E_capacity = E_capacity_useful;
     performance.T_layer_max = max(tank.T_layers);
     performance.T_limit = tank.T_max;
+    performance.P_storage_useful = tank.P_useful;
     econ.Q_plant = Q_plant;
     connect(air.outlet, C1.inlet) annotation(
       Line(points = {{-90, 80}, {-75, 80}}, color = {0, 128, 255}));
@@ -1033,7 +1156,7 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     HeatRecovery ECO(redeclare package Medium = Water) "Economizador de agua de la red" annotation(Placement(transformation(extent = {{78, -102}, {102, -78}})));
     Chimney chimney "Chimenea" annotation(Placement(transformation(extent = {{78, -152}, {102, -128}})));
     GeneratorCC G "Generador del ciclo combinado" annotation(Placement(transformation(extent = {{188, 88}, {212, 112}})));
-    StratifiedTank tank(redeclare package Medium = Water, V = V_tank, H = H_tank, nSeg = nSeg, U = U_tank, T_start = T_tank_start, T_min = T_tank_min, T_max = T_tank_max, T_amb = T_ambient, p_bot_start = p_network) "Depósito estratificado" annotation(Placement(transformation(extent = {{288, -22}, {312, 2}})));
+    replaceable StratifiedTank tank(redeclare package Medium = Water, V = V_tank, H = H_tank, nSeg = nSeg, U = U_tank, T_start = T_tank_start, T_min = T_tank_min, T_max = T_tank_max, T_amb = T_ambient, p_bot_start = p_network) constrainedby StratifiedTank(redeclare package Medium = Water, V = V_tank, H = H_tank, nSeg = nSeg, U = U_tank, T_start = T_tank_start, T_min = T_tank_min, T_max = T_tank_max, T_amb = T_ambient, p_bot_start = p_network) "Depósito estratificado (replaceable: StratifiedTankHP añade la salida HeatPort)" annotation(Placement(transformation(extent = {{288, -22}, {312, 2}})));
     IdealPump pumpPlant(redeclare package Medium = Water) "Bomba de circulación del agua del depósito" annotation(Placement(transformation(extent = {{228, -122}, {252, -98}})));
     Modelica.Blocks.Sources.Constant mPlant(k = m_charge) "Consigna de caudal de carga" annotation(Placement(transformation(extent = {{228, -87}, {252, -63}})));
     CoolingTower tower(redeclare package Medium = Water, Q_max = Q_tower_max, T_out_set = T_tower_set) "Rechazo de calor por temperatura de retorno" annotation(Placement(transformation(extent = {{143, -122}, {167, -98}})));
@@ -1044,7 +1167,8 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     Modelica.Units.SI.HeatFlowRate Q_plant = ECO.Q + cond.Q "Potencia térmica total cedida al agua";
     Modelica.Units.SI.HeatFlowRate Q_rejected = tower.Q "Calor rechazado al ambiente por la torre";
     Modelica.Units.SI.HeatFlowRate Q_into_tank = tank.port_top.m_flow*actualStream(tank.port_top.h_outflow) + tank.port_bot.m_flow*actualStream(tank.port_bot.h_outflow) "Potencia neta de entalpía que entra al depósito por sus dos puertos";
-    Modelica.Units.SI.HeatFlowRate Q_storage = Q_into_tank - tank.Q_loss "Potencia neta acumulada en el depósito; positiva en carga";
+    Modelica.Units.SI.HeatFlowRate Q_delivered = 0 "Calor entregado al consumidor (0 en este ensayo de carga; CentralHeatPort lo redefine)";
+    Modelica.Units.SI.HeatFlowRate Q_storage = Q_into_tank - tank.Q_loss - Q_delivered "Potencia neta acumulada en el depósito; positiva en carga";
     Modelica.Units.SI.HeatFlowRate Q_balance_residual = der(tank.E_stored) - Q_storage "Residuo del balance de energía del depósito para este medio incompresible";
     Modelica.Units.SI.HeatFlowRate Q_aux_storage = Q_plant - Q_rejected - Q_into_tank "Acumulación transitoria en el agua de intercambiadores y torre";
     Modelica.Units.SI.Temperature T_supply = T_hot.T "Temperatura del agua que entra por arriba del depósito";
@@ -1058,8 +1182,8 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     Real eta_global = eta_el + eta_th "Rendimiento de cogeneración bruto";
     Modelica.Units.SI.MassFlowRate m_reference = ref.ports[1].m_flow "Caudal en la referencia de presión; debe ser prácticamente nulo con agua incompresible";
     Boolean tankAboveReference = tank.T_top > T_tank_max "Indica que la capa superior supera la referencia de carga";
-    Modelica.Units.SI.Energy E_capacity_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*(tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Capacidad térmica útil entre las referencias Tmin y Tmax";
-    Modelica.Units.SI.Energy E_tank_useful = sum(tank.tank.ms[i]*Water.specificHeatCapacityCp(tank.tank.mediums[i].state)*min(max(tank.T_layers[i] - tank.T_min, 0), tank.T_max - tank.T_min) for i in 1:tank.nSeg) "Energía útil por capa; excluye el calentamiento por encima de Tmax";
+    Modelica.Units.SI.Energy E_capacity_useful = tank.E_capacity "Capacidad térmica útil entre las referencias Tmin y Tmax";
+    Modelica.Units.SI.Energy E_tank_useful = tank.E_useful "Energía útil por capa; excluye el calentamiento por encima de Tmax";
     EnergyUseMonitor performance "Medidas de aprovechamiento y estados del depósito y la torre" annotation(Placement(transformation(extent = {{315, 50}, {335, 70}})));
     Real eta_useful = performance.eta_useful "Aprovechamiento energético instantáneo";
     Real eta_useful_accum = performance.eta_useful_accum "Aprovechamiento energético acumulado desde el inicio";
@@ -1078,12 +1202,13 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     performance.P_el = G.P_el;
     performance.Q_fuel = CC.Q_fuel;
     performance.Q_generated = ECO.Q + cond.Q;
-    performance.Q_delivered = 0;
+    performance.Q_delivered = Q_delivered;
     performance.Q_rejected = tower.Q;
     performance.E_tank_useful = E_tank_useful;
     performance.E_capacity = E_capacity_useful;
     performance.T_layer_max = max(tank.T_layers);
     performance.T_limit = tank.T_max;
+    performance.P_storage_useful = tank.P_useful;
     connect(air.outlet, C1.inlet) annotation(Line(points = {{-168, 65}, {-147, 65}, {-147, 65}}, color = {185, 114, 35}));
     connect(C1.outlet, IC.inlet) annotation(Line(points = {{-123, 65}, {-102, 65}, {-102, 65}}, color = {185, 114, 35}));
     connect(IC.outlet, C2.inlet) annotation(Line(points = {{-78, 65}, {-57, 65}, {-57, 65}}, color = {185, 114, 35}));
@@ -1129,12 +1254,12 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     input Modelica.Units.SI.Energy E_capacity "Capacidad útil total del depósito";
     input Modelica.Units.SI.Temperature T_layer_max "Máxima temperatura de las capas del depósito";
     input Modelica.Units.SI.Temperature T_limit "Temperatura máxima de referencia";
+    input Modelica.Units.SI.Power P_storage_useful "Variación de la energía útil almacenada (= dE_tank_useful/dt), calculada sin der() de expresiones algebraicas";
     parameter Modelica.Units.SI.Energy E_initial(fixed = false) "Energía útil presente al iniciar el ensayo";
     Modelica.Units.SI.Energy E_el(start = 0, fixed = true) "Electricidad generada desde el inicio";
     Modelica.Units.SI.Energy E_fuel(start = 0, fixed = true) "Combustible consumido desde el inicio";
     Modelica.Units.SI.Energy E_delivered(start = 0, fixed = true) "Calor entregado desde el inicio";
     Modelica.Units.SI.Energy E_rejected(start = 0, fixed = true) "Calor disipado desde el inicio";
-    Modelica.Units.SI.Power P_storage_useful "Aumento o disminución real de energía útil almacenada";
     Real SOC_useful "Fracción de la capacidad útil entre cero y uno";
     Real eta_el "Rendimiento eléctrico del ciclo";
     Real eta_gross "Electricidad y calor bruto antes de rechazo y pérdidas";
@@ -1157,7 +1282,6 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     der(E_fuel) = Q_fuel;
     der(E_delivered) = Q_delivered;
     der(E_rejected) = Q_rejected;
-    P_storage_useful = der(E_tank_useful);
     SOC_useful = E_tank_useful/max(E_capacity, 1);
     eta_el = if Q_fuel > Q_tol then P_el/Q_fuel else 0;
     eta_gross = if Q_fuel > Q_tol then (P_el + Q_generated)/Q_fuel else 0;
@@ -1188,6 +1312,103 @@ package CicleGas2 "v2: cicle combinat (gas + vapor) + dipòsit + vàlvula 3 vies
     extends CicloCombinadoDeposito(m_air = 6.25, m_fuel = 0.1325, m_charge = 15.25, Q_tower_max = 3.125e6, T_tank_start = 323.15);
     annotation(experiment(StopTime = 86400, Interval = 60, Tolerance = 1e-6));
   end EnsayoPotencia125;
+
+  // ======================================================================
+  //  ENSAYOS DE LA SALIDA HEATPORT DEL DEPÓSITO
+  //   A. TestDepositoHeatPort_Q : depósito solo (lleno a 90 °C), el consumidor impone Q (demanda inventada)
+  //   B. TestDepositoHeatPort_T : depósito solo, el consumidor impone T (45 °C) y el caudal por señal
+  //   C. CentralHeatPort        : ciclo combinado + depósito + torre + demanda inventada por el HeatPort
+  // ======================================================================
+
+  model TestDepositoHeatPort_Q "A: depósito solo con salida HeatPort; el consumidor impone la potencia (sinusoide con horas a cero)"
+    extends Modelica.Icons.Example;
+    package Water = Modelica.Media.Water.ConstantPropertyLiquidWater;
+    parameter Modelica.Units.SI.Temperature T_tank_start = 363.15 "Depósito inicialmente lleno (90 °C)";
+    inner Modelica.Fluid.System system(energyDynamics = Modelica.Fluid.Types.Dynamics.FixedInitial, p_start = 3e5) annotation(
+      Placement(transformation(extent = {{-90, 70}, {-70, 90}})));
+    StratifiedTankHP tank(redeclare package Medium = Water, V = 200, H = 12, nSeg = 10, T_start = T_tank_start) annotation(
+      Placement(transformation(extent = {{20, -20}, {40, 20}})));
+    Modelica.Fluid.Sources.Boundary_pT ref(redeclare package Medium = Water, p = 3e5, T = 323.15, nPorts = 1) "Referencia de presión (vaso de expansión)" annotation(
+      Placement(transformation(extent = {{80, -60}, {60, -40}})));
+    DemandaSinus demand(Q_mean = 0.4e6, A = 1.2, t_peak = 8*3600) "Demanda inventada: 9,6 MWh/día ≈ capacidad del depósito" annotation(
+      Placement(transformation(extent = {{-90, -10}, {-70, 10}})));
+    Modelica.Blocks.Math.Gain neg(k = -1) "Q_flow < 0: el calor sale del depósito" annotation(
+      Placement(transformation(extent = {{-60, -10}, {-40, 10}})));
+    Modelica.Thermal.HeatTransfer.Sources.PrescribedHeatFlow consumer(alpha = 0) "Consumidor (sustituir por el modelo del grupo Demanda)" annotation(
+      Placement(transformation(extent = {{-30, -10}, {-10, 10}})));
+    Modelica.Units.SI.HeatFlowRate Q_dem = demand.Q "Potencia pedida";
+    Modelica.Units.SI.HeatFlowRate Q_dis = tank.Q_dis "Potencia entregada por el HeatPort";
+    Modelica.Units.SI.Temperature T_port = tank.heatPort_dis.T "T que devuelve el HeatPort al consumidor";
+    Modelica.Units.SI.Temperature T_supply = tank.T_dis_supply "T de la capa de arriba (entrada al intercambiador)";
+    Modelica.Units.SI.Temperature T_return = tank.T_dis_return "T con la que vuelve el agua al fondo";
+    Modelica.Units.SI.MassFlowRate m_dis = tank.m_dis "Caudal de descarga";
+    Real SOC_useful = tank.E_useful/tank.E_capacity "Estado de carga útil";
+    Modelica.Units.SI.HeatFlowRate Q_balance_residual = der(tank.E_stored) + tank.Q_dis + tank.Q_loss "Debe ser ~0: dE/dt = -Q_dis - Q_loss";
+  equation
+    connect(demand.Q, neg.u) annotation(
+      Line(points = {{-69, 0}, {-62, 0}}, color = {0, 0, 127}));
+    connect(neg.y, consumer.Q_flow) annotation(
+      Line(points = {{-39, 0}, {-30, 0}}, color = {0, 0, 127}));
+    connect(consumer.port, tank.heatPort_dis) annotation(
+      Line(points = {{-10, 0}, {20, 0}}, color = {191, 0, 0}));
+    connect(ref.ports[1], tank.port_bot) annotation(
+      Line(points = {{60, -50}, {30, -50}, {30, -20}}, color = {0, 127, 255}));
+    annotation(
+      experiment(StartTime = 0, StopTime = 86400, Tolerance = 1e-06, Interval = 60),
+      Documentation(info = "<html><p>Sin carga desde la central. El depósito empieza lleno y se vacía con la demanda inventada. Ver Q_dis vs Q_dem, T_port, T_supply, T_return, m_dis y SOC_useful. Q_balance_residual comprueba el balance de energía.</p></html>"));
+  end TestDepositoHeatPort_Q;
+
+  model TestDepositoHeatPort_T "B: depósito solo; el consumidor impone su temperatura (45 °C) y el caudal de descarga va por señal"
+    extends Modelica.Icons.Example;
+    package Water = Modelica.Media.Water.ConstantPropertyLiquidWater;
+    inner Modelica.Fluid.System system(energyDynamics = Modelica.Fluid.Types.Dynamics.FixedInitial, p_start = 3e5) annotation(
+      Placement(transformation(extent = {{-90, 70}, {-70, 90}})));
+    StratifiedTankHP tank(redeclare package Medium = Water, V = 200, H = 12, nSeg = 10, T_start = 363.15, use_m_flow_in = true) annotation(
+      Placement(transformation(extent = {{20, -20}, {40, 20}})));
+    Modelica.Fluid.Sources.Boundary_pT ref(redeclare package Medium = Water, p = 3e5, T = 323.15, nPorts = 1) annotation(
+      Placement(transformation(extent = {{80, -60}, {60, -40}})));
+    Modelica.Thermal.HeatTransfer.Sources.FixedTemperature consumer(T = 318.15) "Consumidor a 45 °C (p. ej. secundario de la vivienda)" annotation(
+      Placement(transformation(extent = {{-30, -10}, {-10, 10}})));
+    Modelica.Blocks.Sources.CombiTimeTable mProfile(table = [0, 2; 6*3600, 2; 6*3600 + 60, 8; 9*3600, 8; 9*3600 + 60, 0; 17*3600, 0; 17*3600 + 60, 5; 22*3600, 5; 22*3600 + 60, 0; 24*3600, 0]) "Caudal de descarga inventado [kg/s]" annotation(
+      Placement(transformation(extent = {{-90, -70}, {-70, -50}})));
+    Modelica.Units.SI.HeatFlowRate Q_dis = tank.Q_dis "Potencia que resulta";
+    Modelica.Units.SI.Temperature T_supply = tank.T_dis_supply;
+    Modelica.Units.SI.Temperature T_return = tank.T_dis_return;
+    Real SOC_useful = tank.E_useful/tank.E_capacity;
+  equation
+    connect(consumer.port, tank.heatPort_dis) annotation(
+      Line(points = {{-10, 0}, {20, 0}}, color = {191, 0, 0}));
+    connect(ref.ports[1], tank.port_bot) annotation(
+      Line(points = {{60, -50}, {30, -50}, {30, -20}}, color = {0, 127, 255}));
+    connect(mProfile.y[1], tank.m_dis_in) annotation(
+      Line(points = {{-69, -60}, {0, -60}, {0, -12}, {18, -12}}, color = {0, 0, 127}));
+    annotation(
+      experiment(StartTime = 0, StopTime = 86400, Tolerance = 1e-06, Interval = 60));
+  end TestDepositoHeatPort_T;
+
+  model CentralHeatPort "C: ciclo combinado -> depósito -> salida HeatPort con demanda inventada; torre en el lazo de carga"
+    extends CicloCombinadoDeposito(redeclare StratifiedTankHP tank, Q_delivered = tank.Q_dis);
+    DemandaSinus demand(Q_mean = 1.0e6, A = 1.2, t_peak = 8*3600) "Demanda inventada: media 1 MW, punta 2,2 MW (< 2,5 MW = m_dis_max·cp·40 K). Con Q impuesto, una demanda mayor que central + depósito enfría el agua sin límite" annotation(
+      Placement(transformation(extent = {{230, 40}, {250, 60}})));
+    Modelica.Blocks.Math.Gain neg(k = -1) annotation(
+      Placement(transformation(extent = {{260, 40}, {280, 60}})));
+    Modelica.Thermal.HeatTransfer.Sources.PrescribedHeatFlow consumer(alpha = 0) "Consumidor por HeatPort" annotation(
+      Placement(transformation(extent = {{290, 40}, {310, 60}})));
+    Modelica.Units.SI.HeatFlowRate Q_dem = demand.Q "Demanda";
+    Modelica.Units.SI.HeatFlowRate Q_dis = tank.Q_dis "Calor entregado por el HeatPort";
+    Modelica.Units.SI.Temperature T_port = tank.heatPort_dis.T "T en el HeatPort";
+    Modelica.Units.SI.Temperature T_dis_return = tank.T_dis_return "Retorno de la descarga al fondo";
+    Modelica.Units.SI.MassFlowRate m_dis = tank.m_dis "Caudal de descarga";
+  equation
+    connect(demand.Q, neg.u) annotation(
+      Line(points = {{251, 50}, {258, 50}}, color = {0, 0, 127}));
+    connect(neg.y, consumer.Q_flow) annotation(
+      Line(points = {{281, 50}, {290, 50}}, color = {0, 0, 127}));
+    connect(consumer.port, tank.heatPort_dis) annotation(
+      Line(points = {{310, 50}, {320, 50}, {320, 30}, {280, 30}, {280, -10}, {288, -10}}, color = {191, 0, 0}));
+    annotation(
+      experiment(StartTime = 0, StopTime = 259200, Tolerance = 1e-06, Interval = 60));
+  end CentralHeatPort;
 
   annotation(
     uses(Modelica(version = "4.0.0")));
